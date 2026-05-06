@@ -43,10 +43,10 @@ RUN uv pip install \
     torch torchvision torchaudio
 
 # install tarball of rocm
+COPY rocm_tarballs/ /tmp/rocm_tarballs/
 RUN mkdir -p /opt/rocm-$ROCM_VERSION && \
-    wget https://rocm.nightlies.amd.com/tarball/therock-dist-linux-$AMDGPU_FAMILY-$ROCM_VERSION.tar.gz && \
-    tar xzf ./therock-dist-linux-$AMDGPU_FAMILY-$ROCM_VERSION.tar.gz -C /opt/rocm-$ROCM_VERSION && \
-    rm therock-dist-linux-$AMDGPU_FAMILY-$ROCM_VERSION.tar.gz && \
+    tar xzf /tmp/rocm_tarballs/therock-dist-linux-$AMDGPU_FAMILY-$ROCM_VERSION.tar.gz -C /opt/rocm-$ROCM_VERSION && \
+    rm -rf /tmp/rocm_tarballs/ && \
     ln -s /opt/rocm-$ROCM_VERSION /opt/rocm
 
 ENV ROCM_PATH=/opt/rocm
@@ -70,7 +70,7 @@ RUN cp /root/.bash_profile /root/.bashrc
 
 
 # clone vllm
-RUN --security=insecure git clone https://github.com/vllm-project/vllm.git && \
+RUN git clone https://github.com/vllm-project/vllm.git && \
     cd vllm && git checkout -b v0.16.0rc0 && \
     python use_existing_torch.py && \
     uv pip install --upgrade numba \
