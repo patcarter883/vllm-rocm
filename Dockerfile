@@ -54,7 +54,8 @@ ENV LD_LIBRARY_PATH=$ROCM_PATH/lib
 # ENV CMAKE_PREFIX_PATH="/app/.venv/lib/python3.12/site-packages/torch/share/cmake/Torch"
 ENV DEVICE_LIB_PATH=$ROCM_PATH/llvm/amdgcn/bitcode  
 ENV HIP_DEVICE_LIB_PATH=$ROCM_PATH/llvm/amdgcn/bitcode
-ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+# Note: Do NOT set FLASH_ATTENTION_TRITON_AMD_ENABLE for CK backend (we need CK, not Triton)
+# FLASH_ATTENTION_TRITON_AMD_ENABLE is not set so CK backend is used for gfx12
 ENV PYTORCH_ROCM_ARCH=${GPU_ARCH}
 ENV PATH=${ROCM_PATH}/bin:${ROCM_PATH}/llvm/bin:${PATH}
 ENV CC=$ROCM_PATH/llvm/bin/clang
@@ -67,26 +68,40 @@ ENV Torch_DIR="/app/.venv/lib/python3.12/site-packages/torch/share/cmake/Torch"
 # copy .bash_profile to .bashrc
 RUN cp /root/.bash_profile /root/.bashrc
 
-
+# Fix hardcoded paths in ROCm torch cmake files (from TheRock builds)
+# The torch package from ROCm nightlies has cmake config files referencing
+# build machine paths like:
+#   .../rocm_sysdeps/lib/pkgconfig/../../include
+# which don't exist in the container.
+# Create intermediate directories so path resolution works with ../.. traversal,
+# then symlink the final include dir to /opt/rocm/include
+RUN mkdir -p /therock/output/build/third-party/sysdeps/linux/libdrm/build/stage/lib/rocm_sysdeps/lib/pkgconfig && \
+    ln -sfn /opt/rocm/include /therock/output/build/third-party/sysdeps/linux/libdrm/build/stage/lib/rocm_sysdeps/include
 
 # clone vllm
 RUN git clone https://github.com/vllm-project/vllm.git && \
-    cd vllm && git checkout -b v0.16.0rc0 && \
-    python use_existing_torch.py && \
+    cd vllm && git checkout v0.20.1 && \
+    # Install numpy<2 FIRST before any other packages to ensure version constraint
+    uv pip install "numpy<2" && \
+    # Upgrade build tools before installing rocm requirements
     uv pip install --upgrade numba \
         scipy \
         cmake \
-        setuptools_scm && \
-    uv pip install "numpy<2" && \
-    # uv pip install -r requirements/rocm.txt
+        "setuptools-scm>=8" && \
+    python use_existing_torch.py && \
     uv pip install -r requirements/rocm.txt && \
     python setup.py develop && \
-    uv pip install /opt/rocm/share/amd_smi
+    # amd_smi is included in TheRock tarball at /opt/rocm/share/amd_smi
+    uv pip install /opt/rocm/share/amd_smi || echo "amd_smi not found, continuing..."
 
-RUN git clone https://github.com/hyoon1/flash-attention.git && \    
-# RUN git clone https://github.com/ROCm/flash-attention.git && \
+# flash-attention with gfx12 support via CK (composable kernel) backend
+# ninja is required for faster parallel compilation (installed via setup_requires)
+# GPU_ARCHS is required for CK to generate gfx12 kernels during build
+# Note: Do NOT set FLASH_ATTENTION_TRITON_AMD_ENABLE as we want CK backend for gfx12
+RUN git clone https://github.com/hyoon1/flash-attention.git && \
     cd flash-attention && \
     git checkout enable-ck-gfx12 && \
-    FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
+    git submodule update --init --recursive csrc/composable_kernel csrc/cutlass && \
+    GPU_ARCHS="gfx1201" python setup.py install
 
 ENTRYPOINT [ "/app/.venv/bin/vllm","serve"]
