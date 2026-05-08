@@ -55,9 +55,10 @@ services:
       - AMD_VISIBLE_DEVICES=0,1
       - FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
       - VLLM_USE_TRITON_AWQ=1
-      - HSA_ENABLE_SDMA=1
-      - HSA_ENABLE_PEER_SDMA=1
+      - HSA_ENABLE_SDMA=0
+      - HSA_ENABLE_PEER_SDMA=0
       - HSA_NO_SCRATCH_RECLAIM=1
+      - NCCL_P2P_LEVEL=SYS
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
       interval: 30s
@@ -76,14 +77,13 @@ services:
       --model cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
       -tp 2
       --enable-expert-parallel
-      --enable-eplb
       --port ${VLLM_PORT:-8000}
       --enable-chunked-prefill
-      --max-model-len auto
+      --max-model-len 16384
       --max-num-seqs 64
       --block-size 256
       --dtype float16
-      --gpu-memory-utilization 0.96
+      --gpu-memory-utilization 0.92
       --kv-cache-dtype fp8
       --language-model-only
       --served-model-name model
