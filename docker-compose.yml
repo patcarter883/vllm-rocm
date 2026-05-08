@@ -2,30 +2,24 @@
 # docker-compose.yml — vLLM & SGLang on AMD RDNA 4
 # =============================================================================
 # Usage:
-#   docker compose up vllm          # Start vLLM only
-#   docker compose up sglang        # Start SGLang only
-#   docker compose up               # Start both (on different ports)
-#   docker compose run benchmark    # Run head-to-head benchmark
+#   docker compose --profile qwen-int8 up qwen-int8
+#   docker compose --profile qwen-tq up qwen-tq
+#   docker compose --profile glm up glm
+#   docker compose --profile genesis up genesis-dryrun
 #
 # Environment:
-#   MODEL           — HuggingFace model ID (default: Qwen/Qwen2.5-0.5B)
-#   VLLM_PORT       — vLLM API port (default: 8001)
-#   SGLANG_PORT     — SGLang API port (default: 30000)
-#   SGLANG_CUDA_GRAPH — Set to 1 to enable CUDA graphs in SGLang (default: 0)
-#   TP_SIZE         — Tensor parallel size (default: 1)
+#   VLLM_PORT       — vLLM API port (default per service)
+#   GLM_PORT        — GLM service port (default: 8002)
 # =============================================================================
 
 services:
   # ---------------------------------------------------------------------------
-  # vLLM — High-throughput inference engine
+  # vLLM — High-throughput inference engine (base service)
   # ---------------------------------------------------------------------------
   vllm_base:
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile.vllm
     image: vllm/vllm-openai-rocm:nightly
-    stdin_open: true # docker run -i
-    tty: true        # docker run -t
+    stdin_open: true
+    tty: true
     entrypoint: /bin/bash
     network_mode: host
     privileged: true
@@ -40,7 +34,7 @@ services:
     cap_add:
       - SYS_PTRACE
     security_opt:
-      - seccomp=unconfined
+      - seccomp:unconfined
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - ./cache:/root/cache
@@ -61,28 +55,20 @@ services:
       - HSA_ENABLE_PEER_SDMA=0
       - HSA_NO_SCRATCH_RECLAIM=1
       - NCCL_P2P_LEVEL=SYS
-      # Genesis patch system — warn-only pin policy (ROCm builds differ from CUDA pins)
+      - PYTORCH_ALLOC_CONF=expandable_segments:True
+      # Genesis patch system
       - GENESIS_VLLM_PIN_POLICY=warn
-      # Genesis opt-in patches for ROCm + Qwen3.6-35B-A3B (hybrid Mamba/MoE)
-      ## Critical: hybrid Mamba deadlock fix
-      - GENESIS_ENABLE_P34_MAMBA_DEADLOCK_GUARD=1
-      ## MoE / scheduler fixes
+      # Genesis opt-in patches (shared — MoE/scheduler/correctness)
       - GENESIS_ENABLE_P72_PROFILE_RUN_CAP=1
       - GENESIS_ENABLE_P31_MOE_ROUTER_FP32_SOFTMAX=1
       - GENESIS_ENABLE_P74_CHUNK_CLAMP=1
-      ## Correctness: block_table zero-fill, ngram optimization
       - GENESIS_ENABLE_P14_BLOCK_TABLE_ZERO=1
       - GENESIS_ENABLE_P86=1
-      ## Qwen3 parser / streaming fixes
-      - GENESIS_ENABLE_PN55_WAKE_UP_HYBRID_KV=1
-      - GENESIS_ENABLE_PN51_QWEN3_STREAMING_THINKING_DISABLED=1
-      - GENESIS_ENABLE_PN66=1
-      - GENESIS_ENABLE_PN67=1
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
-      start_period: 120s
+      start_period: 180s
       retries: 3
     profiles:
       - base
@@ -95,53 +81,171 @@ services:
     profiles:
       - bash
 
-  # Quick Genesis dry-run test — shows which patches apply on ROCm
+  # Quick Genesis dry-run test
   genesis-dryrun:
     extends:
       service: vllm_base
     container_name: rdna4-genesis-dryrun
     entrypoint: ["/bin/bash", "-c"]
-    command: |
-      echo "=== Genesis vLLM Patches: DRY-RUN ==="
-      python3 -m vllm._genesis.patches.apply_all --dry-run 2>&1
-      echo "=== Dry-run complete ==="
+    command:
+      - |
+        echo "=== Genesis vLLM Patches: DRY-RUN ==="
+        python3 -m vllm._genesis.patches.apply_all --dry-run 2>&1
+        echo "=== Dry-run complete ==="
     profiles:
       - genesis
 
-  qwen:
+  # ---------------------------------------------------------------------------
+  # Qwen3.6-35B-A3B — int8_per_token_head KV cache (124K ctx, ~3.5x concurrency)
+  # ---------------------------------------------------------------------------
+  # Best for: throughput-sensitive workloads, low TTFT, general serving
+  # KV cache: 124,416 tokens at 126,976 max-model-len → 3.53x concurrency
+  # ---------------------------------------------------------------------------
+  qwen-int8:
     extends:
       service: vllm_base
-    container_name: rdna4-vllm-qwen
+    container_name: rdna4-vllm-qwen-int8
+    environment:
+      # Qwen3.6-specific Genesis patches (hybrid Mamba/MoE)
+      - GENESIS_ENABLE_P34_MAMBA_DEADLOCK_GUARD=1
+      - GENESIS_ENABLE_PN55_WAKE_UP_HYBRID_KV=1
+      - GENESIS_ENABLE_PN51_QWEN3_STREAMING_THINKING_DISABLED=1
+      - GENESIS_ENABLE_PN66=1
+      - GENESIS_ENABLE_PN67=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
     entrypoint: ["/bin/bash", "-c"]
-    command: |
-      echo "=== Genesis vLLM Patches: applying ==="
-      python3 -m vllm._genesis.patches.apply_all 2>&1 | tee /root/cache/genesis_apply.log
-      echo "=== Genesis apply done, starting vllm serve ==="
-      exec vllm serve \
-        --model cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit \
-        -tp 2 \
-        --enable-expert-parallel \
-        --port ${VLLM_PORT:-8000} \
-        --enable-chunked-prefill \
-        --max-model-len 65536 \
-        --max-num-seqs 64 \
-        --block-size 256 \
-        --dtype float16 \
-        --gpu-memory-utilization 0.92 \
-        --kv-cache-dtype int8_per_token_head \
-        --language-model-only \
-        --served-model-name model \
-        --max-num-batched-tokens 8192 \
-        --reasoning-parser qwen3 \
-        --enable-auto-tool-choice \
-        --tool-call-parser qwen3_coder \
-        --default-chat-template-kwargs '{"preserve_thinking": true}' \
-        --trust-remote-code \
-        --no-disable-cascade-attn \
-        --renderer-num-workers 2 \
-        --enable-prefix-caching \
-        --prefix-caching-hash-algo xxhash \
-        --max-num-partial-prefills 1 \
-        --mm-processor-cache-gb 0
+    command:
+      - |
+        echo "=== Genesis vLLM Patches: applying ==="
+        python3 -m vllm._genesis.patches.apply_all 2>&1 | tee /root/cache/genesis_apply.log
+        echo "=== Genesis apply done, starting vllm serve ==="
+        exec vllm serve \
+          --model cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit \
+          -tp 2 \
+          --enable-expert-parallel \
+          --port ${VLLM_PORT:-8000} \
+          --enable-chunked-prefill \
+          --max-model-len 126976 \
+          --max-num-seqs 64 \
+          --block-size 256 \
+          --dtype float16 \
+          --gpu-memory-utilization 0.92 \
+          --kv-cache-dtype int8_per_token_head \
+          --language-model-only \
+          --served-model-name model \
+          --max-num-batched-tokens 8192 \
+          --reasoning-parser qwen3 \
+          --enable-auto-tool-choice \
+          --tool-call-parser qwen3_coder \
+          --default-chat-template-kwargs '{"preserve_thinking": true}' \
+          --trust-remote-code \
+          --no-disable-cascade-attn \
+          --renderer-num-workers 2 \
+          --enable-prefix-caching \
+          --prefix-caching-hash-algo xxhash \
+          --max-num-partial-prefills 1 \
+          --mm-processor-cache-gb 0
     profiles:
-      - qwen
+      - qwen-int8
+
+  # ---------------------------------------------------------------------------
+  # Qwen3.6-35B-A3B — turboquant_k8v4 KV cache (168K ctx, ~3.5x concurrency)
+  # ---------------------------------------------------------------------------
+  # Best for: long-context workloads needing max KV capacity (+36% vs int8)
+  # KV cache: 168,960 tokens at 172,032 max-model-len → 3.53x concurrency
+  # Trade-off: ~1.5% lower throughput, cold-start TTFT spike (TQ JIT compile)
+  # ---------------------------------------------------------------------------
+  qwen-tq:
+    extends:
+      service: vllm_base
+    container_name: rdna4-vllm-qwen-tq
+    environment:
+      # Qwen3.6-specific Genesis patches (hybrid Mamba/MoE)
+      - GENESIS_ENABLE_P34_MAMBA_DEADLOCK_GUARD=1
+      - GENESIS_ENABLE_PN55_WAKE_UP_HYBRID_KV=1
+      - GENESIS_ENABLE_PN51_QWEN3_STREAMING_THINKING_DISABLED=1
+      - GENESIS_ENABLE_PN66=1
+      - GENESIS_ENABLE_PN67=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8001}/health"]
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "=== Genesis vLLM Patches: applying ==="
+        python3 -m vllm._genesis.patches.apply_all 2>&1 | tee /root/cache/genesis_apply.log
+        echo "=== Genesis apply done, starting vllm serve ==="
+        exec vllm serve \
+          --model cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit \
+          -tp 2 \
+          --enable-expert-parallel \
+          --port ${VLLM_PORT:-8001} \
+          --enable-chunked-prefill \
+          --max-model-len 172032 \
+          --max-num-seqs 64 \
+          --block-size 256 \
+          --dtype float16 \
+          --gpu-memory-utilization 0.92 \
+          --kv-cache-dtype turboquant_k8v4 \
+          --language-model-only \
+          --served-model-name model \
+          --max-num-batched-tokens 8192 \
+          --reasoning-parser qwen3 \
+          --enable-auto-tool-choice \
+          --tool-call-parser qwen3_coder \
+          --default-chat-template-kwargs '{"preserve_thinking": true}' \
+          --trust-remote-code \
+          --no-disable-cascade-attn \
+          --renderer-num-workers 2 \
+          --enable-prefix-caching \
+          --prefix-caching-hash-algo xxhash \
+          --max-num-partial-prefills 1 \
+          --mm-processor-cache-gb 0
+    profiles:
+      - qwen-tq
+
+  # ---------------------------------------------------------------------------
+  # GLM-4.7-Flash (MoE + MLA, AWQ 4-bit) — optimized serving
+  # ---------------------------------------------------------------------------
+  # Architecture: glm4_moe_lite — 47 layers, 64 routed experts (top-4),
+  #   MLA attention (kv_lora_rank=512), 1 MTP speculative-decoding layer
+  # MLA requires fp8_e4m3 KV cache (int8_per_token_head not supported)
+  # ---------------------------------------------------------------------------
+  glm:
+    extends:
+      service: vllm_base
+    container_name: rdna4-vllm-glm
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${GLM_PORT:-8002}/health"]
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "=== Genesis vLLM Patches: applying ==="
+        python3 -m vllm._genesis.patches.apply_all 2>&1 | tee /root/cache/genesis_apply_glm.log
+        echo "=== Genesis apply done, starting vllm serve ==="
+        exec vllm serve \
+          --model cyankiwi/GLM-4.7-Flash-AWQ-4bit \
+          -tp 2 \
+          --enable-expert-parallel \
+          --port ${GLM_PORT:-8002} \
+          --enable-chunked-prefill \
+          --max-model-len 65536 \
+          --max-num-seqs 64 \
+          --block-size 256 \
+          --dtype float16 \
+          --gpu-memory-utilization 0.95 \
+          --kv-cache-dtype fp8_e4m3 \
+          --served-model-name model \
+          --max-num-batched-tokens 8192 \
+          --reasoning-parser glm45 \
+          --enable-auto-tool-choice \
+          --tool-call-parser glm47 \
+          --trust-remote-code \
+          --no-disable-cascade-attn \
+          --renderer-num-workers 2 \
+          --enable-prefix-caching \
+          --prefix-caching-hash-algo xxhash \
+          --max-num-partial-prefills 1 \
+          --mm-processor-cache-gb 0
+    profiles:
+      - glm
