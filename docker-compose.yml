@@ -24,9 +24,9 @@ services:
     #   context: .
     #   dockerfile: Dockerfile.vllm
     image: vllm/vllm-openai-rocm:nightly
-    # stdin_open: true # docker run -i
-    # tty: true        # docker run -t
-    # entrypoint: /bin/bash
+    stdin_open: true # docker run -i
+    tty: true        # docker run -t
+    entrypoint: /bin/bash
     network_mode: host
     privileged: true
     devices:
@@ -45,6 +45,8 @@ services:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - ./cache:/root/cache
       - ./cache/vllm:/root/.cache/vllm
+      # Genesis vLLM patches — mount _genesis into vllm site-packages
+      - ./genesis/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
     environment:
       - TRITON_CACHE_DIR=/root/cache/triton
       - PYTORCH_TUNABLEOP_FILENAME=/root/cache/tunableop/tunableop_merged.csv
@@ -59,6 +61,23 @@ services:
       - HSA_ENABLE_PEER_SDMA=0
       - HSA_NO_SCRATCH_RECLAIM=1
       - NCCL_P2P_LEVEL=SYS
+      # Genesis patch system — warn-only pin policy (ROCm builds differ from CUDA pins)
+      - GENESIS_VLLM_PIN_POLICY=warn
+      # Genesis opt-in patches for ROCm + Qwen3.6-35B-A3B (hybrid Mamba/MoE)
+      ## Critical: hybrid Mamba deadlock fix
+      - GENESIS_ENABLE_P34_MAMBA_DEADLOCK_GUARD=1
+      ## MoE / scheduler fixes
+      - GENESIS_ENABLE_P72_PROFILE_RUN_CAP=1
+      - GENESIS_ENABLE_P31_MOE_ROUTER_FP32_SOFTMAX=1
+      - GENESIS_ENABLE_P74_CHUNK_CLAMP=1
+      ## Correctness: block_table zero-fill, ngram optimization
+      - GENESIS_ENABLE_P14_BLOCK_TABLE_ZERO=1
+      - GENESIS_ENABLE_P86=1
+      ## Qwen3 parser / streaming fixes
+      - GENESIS_ENABLE_PN55_WAKE_UP_HYBRID_KV=1
+      - GENESIS_ENABLE_PN51_QWEN3_STREAMING_THINKING_DISABLED=1
+      - GENESIS_ENABLE_PN66=1
+      - GENESIS_ENABLE_PN67=1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
       interval: 30s
@@ -68,36 +87,61 @@ services:
     profiles:
       - base
 
+  bash:
+    extends:
+      service: vllm_base
+    container_name: rdna4-vllm-bash
+    entrypoint: /bin/bash
+    profiles:
+      - bash
+
+  # Quick Genesis dry-run test — shows which patches apply on ROCm
+  genesis-dryrun:
+    extends:
+      service: vllm_base
+    container_name: rdna4-genesis-dryrun
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      echo "=== Genesis vLLM Patches: DRY-RUN ==="
+      python3 -m vllm._genesis.patches.apply_all --dry-run 2>&1
+      echo "=== Dry-run complete ==="
+    profiles:
+      - genesis
+
   qwen:
     extends:
       service: vllm_base
     container_name: rdna4-vllm-qwen
-    entrypoint: vllm serve
+    entrypoint: ["/bin/bash", "-c"]
     command: |
-      --model cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
-      -tp 2
-      --enable-expert-parallel
-      --port ${VLLM_PORT:-8000}
-      --enable-chunked-prefill
-      --max-model-len 65536
-      --max-num-seqs 64
-      --block-size 256
-      --dtype float16
-      --gpu-memory-utilization 0.92
-      --kv-cache-dtype int8_per_token_head
-      --language-model-only
-      --served-model-name model
-      --max-num-batched-tokens 8192
-      --reasoning-parser qwen3
-      --enable-auto-tool-choice
-      --tool-call-parser qwen3_coder
-      --default-chat-template-kwargs '{"preserve_thinking": true}'
-      --trust-remote-code
-      --no-disable-cascade-attn
-      --renderer-num-workers 2
-      --enable-prefix-caching
-      --prefix-caching-hash-algo xxhash
-      --max-num-partial-prefills 1
-      --mm-processor-cache-gb 0
+      echo "=== Genesis vLLM Patches: applying ==="
+      python3 -m vllm._genesis.patches.apply_all 2>&1 | tee /root/cache/genesis_apply.log
+      echo "=== Genesis apply done, starting vllm serve ==="
+      exec vllm serve \
+        --model cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit \
+        -tp 2 \
+        --enable-expert-parallel \
+        --port ${VLLM_PORT:-8000} \
+        --enable-chunked-prefill \
+        --max-model-len 65536 \
+        --max-num-seqs 64 \
+        --block-size 256 \
+        --dtype float16 \
+        --gpu-memory-utilization 0.92 \
+        --kv-cache-dtype int8_per_token_head \
+        --language-model-only \
+        --served-model-name model \
+        --max-num-batched-tokens 8192 \
+        --reasoning-parser qwen3 \
+        --enable-auto-tool-choice \
+        --tool-call-parser qwen3_coder \
+        --default-chat-template-kwargs '{"preserve_thinking": true}' \
+        --trust-remote-code \
+        --no-disable-cascade-attn \
+        --renderer-num-workers 2 \
+        --enable-prefix-caching \
+        --prefix-caching-hash-algo xxhash \
+        --max-num-partial-prefills 1 \
+        --mm-processor-cache-gb 0
     profiles:
       - qwen
