@@ -79,12 +79,12 @@ services:
       --enable-expert-parallel
       --port ${VLLM_PORT:-8000}
       --enable-chunked-prefill
-      --max-model-len 16384
+      --max-model-len 65536
       --max-num-seqs 64
       --block-size 256
       --dtype float16
       --gpu-memory-utilization 0.92
-      --kv-cache-dtype fp8
+      --kv-cache-dtype int8_per_token_head
       --language-model-only
       --served-model-name model
       --max-num-batched-tokens 8192
