@@ -104,4 +104,15 @@ RUN git clone https://github.com/hyoon1/flash-attention.git && \
     git submodule update --init --recursive csrc/composable_kernel csrc/cutlass && \
     GPU_ARCHS="gfx1201" python setup.py install
 
-ENTRYPOINT [ "/app/.venv/bin/vllm","serve"]
+# Copy and apply RDNA 4 container patches
+COPY patch_vllm_rdna4.py /tmp/patch_vllm_rdna4.py
+RUN mkdir -p /app/vllm/vllm/rocm_patches && \
+    touch /app/vllm/vllm/rocm_patches/__init__.py && \
+    python3 /tmp/patch_vllm_rdna4.py /app/vllm && \
+    rm /tmp/patch_vllm_rdna4.py
+
+WORKDIR /app/vllm
+
+RUN uv pip install /opt/rocm/share/amd_smi
+
+ENTRYPOINT ["/bin/bash"]

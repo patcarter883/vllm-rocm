@@ -1,0 +1,103 @@
+# =============================================================================
+# docker-compose.yml — vLLM & SGLang on AMD RDNA 4
+# =============================================================================
+# Usage:
+#   docker compose up vllm          # Start vLLM only
+#   docker compose up sglang        # Start SGLang only
+#   docker compose up               # Start both (on different ports)
+#   docker compose run benchmark    # Run head-to-head benchmark
+#
+# Environment:
+#   MODEL           — HuggingFace model ID (default: Qwen/Qwen2.5-0.5B)
+#   VLLM_PORT       — vLLM API port (default: 8001)
+#   SGLANG_PORT     — SGLang API port (default: 30000)
+#   SGLANG_CUDA_GRAPH — Set to 1 to enable CUDA graphs in SGLang (default: 0)
+#   TP_SIZE         — Tensor parallel size (default: 1)
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # vLLM — High-throughput inference engine
+  # ---------------------------------------------------------------------------
+  vllm_base:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.vllm
+    image: vllm/vllm-openai-rocm:nightly
+    # stdin_open: true # docker run -i
+    # tty: true        # docker run -t
+    # entrypoint: /bin/bash
+    network_mode: host
+    privileged: true
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+    ipc: host
+    shm_size: 32G
+    runtime: amd
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ./cache:/root/cache
+      - ./cache/vllm:/root/.cache/vllm
+    environment:
+      - TRITON_CACHE_DIR=/root/cache/triton
+      - PYTORCH_TUNABLEOP_FILENAME=/root/cache/tunableop/tunableop_merged.csv
+      - PYTORCH_TUNABLEOP_UNTUNED_FILENAME=/root/cache/tunableop/tunableop_untuned.csv
+      - PYTORCH_ROCM_ARCH=gfx1201
+      - VLLM_USE_V2_MODEL_RUNNER=0
+      - VLLM_LOGGING_LEVEL=INFO
+      - AMD_VISIBLE_DEVICES=0,1
+      - FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+      - VLLM_USE_TRITON_AWQ=1
+      - HSA_ENABLE_SDMA=1
+      - HSA_ENABLE_PEER_SDMA=1
+      - HSA_NO_SCRATCH_RECLAIM=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    profiles:
+      - base
+
+  qwen:
+    extends:
+      service: vllm_base
+    container_name: rdna4-vllm-qwen
+    entrypoint: vllm serve
+    command: |
+      --model cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
+      -tp 2
+      --enable-expert-parallel
+      --enable-eplb
+      --port ${VLLM_PORT:-8000}
+      --enable-chunked-prefill
+      --max-model-len auto
+      --max-num-seqs 64
+      --block-size 256
+      --dtype float16
+      --gpu-memory-utilization 0.96
+      --kv-cache-dtype fp8
+      --language-model-only
+      --served-model-name model
+      --max-num-batched-tokens 8192
+      --reasoning-parser qwen3
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_coder
+      --default-chat-template-kwargs '{"preserve_thinking": true}'
+      --trust-remote-code
+      --no-disable-cascade-attn
+      --renderer-num-workers 2
+      --enable-prefix-caching
+      --prefix-caching-hash-algo xxhash
+      --max-num-partial-prefills 1
+      --mm-processor-cache-gb 0
+    profiles:
+      - qwen
