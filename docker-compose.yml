@@ -126,6 +126,15 @@ services:
       - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1               # Auto-force tool output format
       - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1        # Long-context stability
       - GENESIS_ENABLE_PN56_QWEN3CODER_XML_FALLBACK=1      # XML parse failure fallback
+      # Tool-calling: schema filter + lazy reasoner (agent harness reliability)
+      - GENESIS_ENABLE_PN70_TOOL_SCHEMA_FILTER=1           # Filter xgrammar-incompat tools from anyOf
+      - GENESIS_ENABLE_PN16_LAZY_REASONER=1                # Per-request reasoning token control
+      # Performance: MoE + prefix cache + memory
+      - GENESIS_ENABLE_P37=1                                # MoE intermediate cache pool (~553 MiB saved)
+      - GENESIS_ENABLE_P85=1                                # Hybrid fine-shadow prefix cache
+      - GENESIS_ENABLE_PN19_SCOPED_MAX_SPLIT=1              # 200-500 MiB VRAM savings during model load
+      - GENESIS_ENABLE_PN12_FFN_INTERMEDIATE_POOL=1         # FFN scratch pool (Cliff 1 fix)
+      - GENESIS_ENABLE_P58_ASYNC_PLACEHOLDER_FIX=1          # Async scheduler -1 fix
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
     entrypoint: ["/bin/bash", "-c"]
@@ -156,7 +165,7 @@ services:
           --trust-remote-code \
           --no-disable-cascade-attn \
           --renderer-num-workers 2 \
-          --no-enable-prefix-caching \
+          --enable-prefix-caching \
           --prefix-caching-hash-algo xxhash \
           --max-num-partial-prefills 1 \
           --mm-processor-cache-gb 0
@@ -258,6 +267,15 @@ services:
       - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1               # Auto-force tool output format
       - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1        # Long-context stability
       - GENESIS_ENABLE_PN56_QWEN3CODER_XML_FALLBACK=1      # XML parse failure fallback
+      # Tool-calling: schema filter + lazy reasoner (agent harness reliability)
+      - GENESIS_ENABLE_PN70_TOOL_SCHEMA_FILTER=1           # Filter xgrammar-incompat tools from anyOf
+      - GENESIS_ENABLE_PN16_LAZY_REASONER=1                # Per-request reasoning token control
+      # Performance: MoE + prefix cache + memory
+      - GENESIS_ENABLE_P37=1                                # MoE intermediate cache pool (~553 MiB saved)
+      - GENESIS_ENABLE_P85=1                                # Hybrid fine-shadow prefix cache
+      - GENESIS_ENABLE_PN19_SCOPED_MAX_SPLIT=1              # 200-500 MiB VRAM savings during model load
+      - GENESIS_ENABLE_PN12_FFN_INTERMEDIATE_POOL=1         # FFN scratch pool (Cliff 1 fix)
+      - GENESIS_ENABLE_P58_ASYNC_PLACEHOLDER_FIX=1          # Async scheduler -1 fix
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8001}/health"]
     entrypoint: ["/bin/bash", "-c"]
