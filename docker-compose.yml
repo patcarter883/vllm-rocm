@@ -5,11 +5,13 @@
 #   docker compose --profile qwen-int8 up qwen-int8
 #   docker compose --profile qwen-tq up qwen-tq
 #   docker compose --profile glm up glm
+#   docker compose --profile laguna up laguna
 #   docker compose --profile genesis up genesis-dryrun
 #
 # Environment:
 #   VLLM_PORT       — vLLM API port (default per service)
 #   GLM_PORT        — GLM service port (default: 8002)
+#   LAGUNA_PORT     — Laguna service port (default: 8003)
 # =============================================================================
 
 services:
@@ -358,3 +360,75 @@ services:
           --mm-processor-cache-gb 0
     profiles:
       - glm
+
+  # ---------------------------------------------------------------------------
+  # Poolside Laguna-XS.2 (MoE + SWA, INT4) — DFlash speculative decoding
+  # ---------------------------------------------------------------------------
+  # Architecture: laguna — 40 layers (10 full_attn + 30 sliding_attn SWA=512)
+  #   256 experts (top-8), 3B active params, 33B total
+  #   compressed-tensors INT4 quantization, FP8 KV cache (built-in)
+  #   DFlash draft: 5-layer Llama, 1.2 GB, 7 speculative tokens, ~70% acceptance
+  #   Pure attention model — NO Mamba/linear_attention (DFlash page_size bug doesn't apply)
+  #   SWA layers only cache 512 tokens → extremely KV-efficient
+  #   Requires VLLM_USE_DEEP_GEMM=0 (DeepGEMM incompatible with DFlash draft path)
+  #   PR #41880 (Laguna DFlash support) merged May 7, in nightly since May 9
+  # ---------------------------------------------------------------------------
+  laguna:
+    extends:
+      service: vllm_base
+    container_name: rdna4-vllm-laguna
+    environment:
+      - VLLM_USE_DEEP_GEMM=0
+      # --- DFlash spec-decode patches (all generic infrastructure) ---
+      - GENESIS_ENABLE_PN21_DFLASH_SWA=1               # SWA layer support in DFlash (CRITICAL: 30/40 layers are SWA)
+      - GENESIS_ENABLE_PN24_DFLASH_AUX_LAYER_FIX=1     # Aux layer indexing off-by-one fix
+      - GENESIS_ENABLE_PN9_INDEPENDENT_DRAFTER_ATTN=1  # Independent drafter attn backend
+      - GENESIS_ENABLE_P56_SPEC_DECODE_GUARD=1         # Spec-decode decode path guard
+      - GENESIS_ENABLE_P57_SPEC_DECODE_CAPTURE_SAFE=1  # Spec-decode capture safe buffers
+      - GENESIS_ENABLE_P62_STRUCT_OUT_SPEC_TIMING=1    # Structured output + spec-decode timing
+      - GENESIS_ENABLE_P71_BLOCK_VERIFY=1              # Block verify correctness
+      - GENESIS_ENABLE_P94=1                           # Spec-decode zero alloc
+      # --- Tool-calling (generic infrastructure only, not Qwen3-specific) ---
+      - GENESIS_ENABLE_PN70_TOOL_SCHEMA_FILTER=1       # Tool schema subset filter (generic)
+      - GENESIS_ENABLE_PN16_LAZY_REASONER=1            # Lazy reasoner (generic serving.py)
+      # --- Performance (all generic) ---
+      - GENESIS_ENABLE_P37=1                           # MoE intermediate cache
+      - GENESIS_ENABLE_PN19_SCOPED_MAX_SPLIT=1         # Scoped max split
+      - GENESIS_ENABLE_PN12_FFN_INTERMEDIATE_POOL=1    # FFN intermediate pool
+      - GENESIS_ENABLE_P58_ASYNC_PLACEHOLDER_FIX=1     # Async scheduler fix
+      - GENESIS_ENABLE_P72_PROFILE_RUN_CAP=1           # Profile run cap
+      - GENESIS_ENABLE_P74_CHUNK_CLAMP=1               # Chunk clamp
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${LAGUNA_PORT:-8000}/health"]
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "=== Genesis vLLM Patches: applying ==="
+        python3 -m vllm._genesis.patches.apply_all 2>&1 | tee /root/cache/genesis_apply_laguna.log
+        echo "=== Genesis apply done, starting vllm serve ==="
+        exec vllm serve \
+          --model poolside/Laguna-XS.2-INT4 \
+          -tp 2 \
+          --enable-expert-parallel \
+          --port ${LAGUNA_PORT:-8000} \
+          --enable-chunked-prefill \
+          --max-model-len 65536 \
+          --max-num-seqs 64 \
+          --block-size 256 \
+          --dtype float16 \
+          --gpu-memory-utilization 0.92 \
+          --served-model-name model \
+          --max-num-batched-tokens 8192 \
+          --reasoning-parser poolside_v1 \
+          --enable-auto-tool-choice \
+          --tool-call-parser poolside_v1 \
+          --default-chat-template-kwargs '{"enable_thinking": true}' \
+          --trust-remote-code \
+          --renderer-num-workers 2 \
+          --enable-prefix-caching \
+          --prefix-caching-hash-algo xxhash \
+          --max-num-partial-prefills 1 \
+          --mm-processor-cache-gb 0 \
+          --speculative-config '{"method": "dflash", "model": "poolside/Laguna-XS.2-speculator.dflash", "num_speculative_tokens": 7}'
+    profiles:
+      - laguna
