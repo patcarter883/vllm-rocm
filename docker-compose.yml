@@ -55,6 +55,7 @@ services:
       - HSA_ENABLE_PEER_SDMA=0
       - HSA_NO_SCRATCH_RECLAIM=1
       - NCCL_P2P_LEVEL=SYS
+      - VLLM_SLEEP_WHEN_IDLE=1
       - PYTORCH_ALLOC_CONF=expandable_segments:True
       # Genesis patch system
       - GENESIS_VLLM_PIN_POLICY=warn
@@ -64,6 +65,12 @@ services:
       - GENESIS_ENABLE_P74_CHUNK_CLAMP=1
       - GENESIS_ENABLE_P14_BLOCK_TABLE_ZERO=1
       - GENESIS_ENABLE_P86=1
+      - GENESIS_ENABLE_P59_QWEN3_TOOL_RECOVERY=1           # Embedded tool_call in reasoning
+      - GENESIS_ENABLE_P61_QWEN3_MULTI_TOOL=1             # Multi-tool first occurrence  
+      - GENESIS_ENABLE_P61B_STREAMING_OVERLAP=1            # Partial tag overlap guard
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1               # Auto-force tool output format
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1        # Long-context stability
+      - GENESIS_ENABLE_PN56_QWEN3CODER_XML_FALLBACK=1      # XML parse failure fallback
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -112,6 +119,13 @@ services:
       - GENESIS_ENABLE_PN51_QWEN3_STREAMING_THINKING_DISABLED=1
       - GENESIS_ENABLE_PN66=1
       - GENESIS_ENABLE_PN67=1
+      # Tool-calling reliability patches (P59-P69 family)
+      - GENESIS_ENABLE_P59_QWEN3_TOOL_RECOVERY=1           # Embedded tool_call in reasoning
+      - GENESIS_ENABLE_P61_QWEN3_MULTI_TOOL=1             # Multi-tool first occurrence
+      - GENESIS_ENABLE_P61B_STREAMING_OVERLAP=1            # Partial tag overlap guard
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1               # Auto-force tool output format
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1        # Long-context stability
+      - GENESIS_ENABLE_PN56_QWEN3CODER_XML_FALLBACK=1      # XML parse failure fallback
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
     entrypoint: ["/bin/bash", "-c"]
@@ -142,12 +156,82 @@ services:
           --trust-remote-code \
           --no-disable-cascade-attn \
           --renderer-num-workers 2 \
-          --enable-prefix-caching \
+          --no-enable-prefix-caching \
           --prefix-caching-hash-algo xxhash \
           --max-num-partial-prefills 1 \
           --mm-processor-cache-gb 0
     profiles:
       - qwen-int8
+
+  # ---------------------------------------------------------------------------
+  # Qwen3.6-27B dense — DFlash speculative decoding
+  # ---------------------------------------------------------------------------
+  # Experimental: 27B dense model with DFlash block-diffusion draft model
+  # Uses fp8 KV cache to avoid per-token-head page-size mismatch with DFlash
+  # 27B DFlash draft: 3.5 GB FP16, 5 layers, kv_heads=8, sliding+full attention
+  # ---------------------------------------------------------------------------
+  qwen-27b-dflash:
+    extends:
+      service: vllm_base
+    container_name: rdna4-vllm-qwen-27b-dflash
+    volumes:
+      - ./models/27b-dflash-patched/config.json:/root/.cache/huggingface/hub/models--deepsweet--Qwen3.6-27B-DFlash-FP16/snapshots/3d5d72dbc277fa66c5f6ce702fedfe39b8073174/config.json:ro
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Genesis patches for hybrid Mamba model
+      - GENESIS_ENABLE_P34_MAMBA_DEADLOCK_GUARD=1
+      - GENESIS_ENABLE_PN55_WAKE_UP_HYBRID_KV=1
+      - GENESIS_ENABLE_PN51_QWEN3_STREAMING_THINKING_DISABLED=1
+      - GENESIS_ENABLE_PN66=1
+      - GENESIS_ENABLE_PN67=1
+      # Tool-calling patches
+      - GENESIS_ENABLE_P59_QWEN3_TOOL_RECOVERY=1
+      - GENESIS_ENABLE_P61_QWEN3_MULTI_TOOL=1
+      - GENESIS_ENABLE_P61B_STREAMING_OVERLAP=1
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
+      - GENESIS_ENABLE_PN56_QWEN3CODER_XML_FALLBACK=1
+      # Speculative decoding patches
+      - GENESIS_ENABLE_P60_GDN_NGRAM_FIX=1
+      - GENESIS_ENABLE_P60B_TRITON_KERNEL=1
+      - GENESIS_ENABLE_P62_STRUCT_OUT_SPEC_TIMING=1
+      - GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1
+      - GENESIS_ENABLE_PN40_DFLASH_OMNIBUS=1
+      - GENESIS_ENABLE_PN38_DFLASH_QUANT_DRAFTER=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "=== Genesis vLLM Patches: applying ==="
+        python3 -m vllm._genesis.patches.apply_all 2>&1 | tee /root/cache/genesis_apply.log
+        echo "=== Genesis apply done, starting vllm serve ==="
+        exec vllm serve \
+          --model cyankiwi/Qwen3.6-27B-AWQ-INT4 \
+          -tp 2 \
+          --port ${VLLM_PORT:-8000} \
+          --enable-chunked-prefill \
+          --max-model-len 16384 \
+          --max-num-seqs 16 \
+          --block-size 16 \
+          --dtype float16 \
+          --gpu-memory-utilization 0.85 \
+          --kv-cache-dtype fp8_e4m3 \
+          --served-model-name model \
+          --max-num-batched-tokens 8192 \
+          --reasoning-parser qwen3 \
+          --enable-auto-tool-choice \
+          --tool-call-parser qwen3_coder \
+          --default-chat-template-kwargs '{"preserve_thinking": true}' \
+          --trust-remote-code \
+          --renderer-num-workers 2 \
+          --no-enable-prefix-caching \
+          --prefix-caching-hash-algo xxhash \
+          --max-num-partial-prefills 1 \
+          --mm-processor-cache-gb 0 \
+          --speculative-config '{"method": "dflash", "model": "deepsweet/Qwen3.6-27B-DFlash-FP16", "num_speculative_tokens": 5}'
+    profiles:
+      - qwen-27b-dflash
 
   # ---------------------------------------------------------------------------
   # Qwen3.6-35B-A3B — turboquant_k8v4 KV cache (168K ctx, ~3.5x concurrency)
@@ -167,6 +251,13 @@ services:
       - GENESIS_ENABLE_PN51_QWEN3_STREAMING_THINKING_DISABLED=1
       - GENESIS_ENABLE_PN66=1
       - GENESIS_ENABLE_PN67=1
+      # Tool-calling reliability patches (P59-P69 family, non-speculative)
+      - GENESIS_ENABLE_P59_QWEN3_TOOL_RECOVERY=1           # Embedded tool_call in reasoning
+      - GENESIS_ENABLE_P61_QWEN3_MULTI_TOOL=1             # Multi-tool first occurrence
+      - GENESIS_ENABLE_P61B_STREAMING_OVERLAP=1            # Partial tag overlap guard
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1               # Auto-force tool output format
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1        # Long-context stability
+      - GENESIS_ENABLE_PN56_QWEN3CODER_XML_FALLBACK=1      # XML parse failure fallback
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8001}/health"]
     entrypoint: ["/bin/bash", "-c"]
@@ -179,7 +270,7 @@ services:
           --model cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit \
           -tp 2 \
           --enable-expert-parallel \
-          --port ${VLLM_PORT:-8001} \
+          --port ${VLLM_PORT:-8000} \
           --enable-chunked-prefill \
           --max-model-len 172032 \
           --max-num-seqs 64 \
@@ -193,7 +284,7 @@ services:
           --reasoning-parser qwen3 \
           --enable-auto-tool-choice \
           --tool-call-parser qwen3_coder \
-          --default-chat-template-kwargs '{"preserve_thinking": true}' \
+          --default-chat-template-kwargs '{"preserve_thinking": false}' \
           --trust-remote-code \
           --no-disable-cascade-attn \
           --renderer-num-workers 2 \
@@ -227,7 +318,7 @@ services:
           --model cyankiwi/GLM-4.7-Flash-AWQ-4bit \
           -tp 2 \
           --enable-expert-parallel \
-          --port ${GLM_PORT:-8002} \
+          --port ${GLM_PORT:-8000} \
           --enable-chunked-prefill \
           --max-model-len 65536 \
           --max-num-seqs 64 \
