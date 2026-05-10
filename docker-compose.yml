@@ -71,6 +71,7 @@ services:
       - VLLM_LOGGING_LEVEL=INFO
       - AMD_VISIBLE_DEVICES=0,1
       - FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+      - VLLM_ROCM_USE_AITER=1
       - VLLM_USE_TRITON_AWQ=1
       - HSA_ENABLE_SDMA=0
       - HSA_ENABLE_PEER_SDMA=0
@@ -78,6 +79,7 @@ services:
       - NCCL_P2P_LEVEL=SYS
       - NCCL_SHM_DISABLE=0
       - NCCL_P2P_DISABLE=0
+      - TORCH_FLOAT32_MATMUL_PRECISION=high
       # VLLM_SLEEP_WHEN_IDLE removed in v0.20+ (now default behavior)
       - PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.6,max_split_size_mb:128
       # Genesis patch system
@@ -195,7 +197,7 @@ services:
           --default-chat-template-kwargs '{"preserve_thinking": true}' \
           --trust-remote-code \
           --no-disable-cascade-attn \
-          --renderer-num-workers 4 \
+          --renderer-num-workers 6 \
           --enable-prefix-caching \
           --prefix-caching-hash-algo xxhash \
           --max-num-partial-prefills 1 \
@@ -413,7 +415,7 @@ services:
           --default-chat-template-kwargs '{"preserve_thinking": false}' \
           --trust-remote-code \
           --no-disable-cascade-attn \
-          --renderer-num-workers 2 \
+          --renderer-num-workers 6 \
           --enable-prefix-caching \
           --prefix-caching-hash-algo xxhash \
           --max-num-partial-prefills 1 \
@@ -432,34 +434,65 @@ services:
     extends:
       service: vllm_base
     container_name: rdna4-vllm-glm
+    environment:
+      # Qwen3.6-specific Genesis patches (hybrid Mamba/MoE)
+      - GENESIS_ENABLE_P34_MAMBA_DEADLOCK_GUARD=1
+      - GENESIS_ENABLE_PN55_WAKE_UP_HYBRID_KV=1
+      - GENESIS_ENABLE_PN51_QWEN3_STREAMING_THINKING_DISABLED=1
+      - GENESIS_ENABLE_PN66=1
+      - GENESIS_ENABLE_PN67=1
+      # Tool-calling reliability patches (P59-P69 family)
+      - GENESIS_ENABLE_P59_QWEN3_TOOL_RECOVERY=1           # Embedded tool_call in reasoning
+      - GENESIS_ENABLE_P61_QWEN3_MULTI_TOOL=1             # Multi-tool first occurrence
+      - GENESIS_ENABLE_P61B_STREAMING_OVERLAP=1            # Partial tag overlap guard
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1               # Auto-force tool output format
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1        # Long-context stability
+      - GENESIS_ENABLE_PN56_QWEN3CODER_XML_FALLBACK=1      # XML parse failure fallback
+      # Tool-calling: schema filter + lazy reasoner (agent harness reliability)
+      - GENESIS_ENABLE_PN70_TOOL_SCHEMA_FILTER=1           # Filter xgrammar-incompat tools from anyOf
+      - GENESIS_ENABLE_PN16_LAZY_REASONER=1                # Per-request reasoning token control
+      # Performance: MoE + prefix cache + memory
+      - GENESIS_ENABLE_P37=1                                # MoE intermediate cache pool (~553 MiB saved)
+      - GENESIS_ENABLE_P85=1                                # Hybrid fine-shadow prefix cache
+      - GENESIS_ENABLE_PN19_SCOPED_MAX_SPLIT=1              # 200-500 MiB VRAM savings during model load
+      - GENESIS_ENABLE_PN12_FFN_INTERMEDIATE_POOL=1         # FFN scratch pool (Cliff 1 fix)
+      - GENESIS_ENABLE_P58_ASYNC_PLACEHOLDER_FIX=1          # Async scheduler -1 fix
+      # Speculative decoding patches
+      - GENESIS_ENABLE_P60_GDN_NGRAM_FIX=1
+      - GENESIS_ENABLE_P60B_TRITON_KERNEL=1
+      - GENESIS_ENABLE_P62_STRUCT_OUT_SPEC_TIMING=1
+      - GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1
+      - GENESIS_ENABLE_PN40_DFLASH_OMNIBUS=1
+      - GENESIS_ENABLE_PN38_DFLASH_QUANT_DRAFTER=1
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${GLM_PORT:-8002}/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
         echo "=== Genesis vLLM Patches: applying ==="
-        python3 -m vllm._genesis.patches.apply_all 2>&1 | tee /root/cache/genesis_apply_glm.log
+        python3 -m vllm._genesis.patches.apply_all 2>&1 | tee /root/cache/genesis_apply.log
         echo "=== Genesis apply done, starting vllm serve ==="
         exec vllm serve \
           --model cyankiwi/GLM-4.7-Flash-AWQ-4bit \
           -tp 2 \
           --enable-expert-parallel \
-          --port ${GLM_PORT:-8000} \
+          --port ${VLLM_PORT:-8000} \
           --enable-chunked-prefill \
-          --max-model-len 65536 \
-          --max-num-seqs 64 \
-          --block-size 256 \
+          --max-model-len 100000 \
+          --max-num-seqs 80 \
           --dtype float16 \
           --gpu-memory-utilization 0.95 \
           --kv-cache-dtype fp8 \
+          --language-model-only \
           --served-model-name model \
           --max-num-batched-tokens 8192 \
-          --reasoning-parser glm45 \
+          --reasoning-parser qwen3 \
           --enable-auto-tool-choice \
-          --tool-call-parser glm47 \
+          --tool-call-parser qwen3_coder \
+          --default-chat-template-kwargs '{"clear_thinking": false}' \
           --trust-remote-code \
           --no-disable-cascade-attn \
-          --renderer-num-workers 2 \
+          --renderer-num-workers 4 \
           --enable-prefix-caching \
           --prefix-caching-hash-algo xxhash \
           --max-num-partial-prefills 1 \
